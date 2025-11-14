@@ -17,6 +17,10 @@
         }                                                                 \
     } while (0)
 
+/*
+Warp-divergence could cause kernel to behave SC like. 
+the reason is the if (tid==0) part, which will activate only one lane when execute, causing divergence
+*/
 __global__ void sb_litmus_test(int *x, int *y, int *r0, int *r1, int iterations)
 {
     int tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -56,6 +60,7 @@ enum WeakOrder : int
     FENCE_SC_SYS = 2,
     REL_ACQ_GPU = 3,
 };
+
 __global__ void sb_litmus_test_param(int *x, int *y,
                                      int *r0, int *r1,
                                      int iterations,
