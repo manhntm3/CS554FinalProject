@@ -6,4 +6,4 @@ The final report of this project could be found here.
 
 
 Build and run: 
-nvcc -v
+nvcc -std=c++17 -arch=sm_75 ./litmus_tests.cu -o litmus_test
