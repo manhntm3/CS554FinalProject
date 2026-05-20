@@ -1,6 +1,25 @@
+/*
+ * litmus_tests.cu  —  CUDA weak-memory litmus test suite
+ *
+ * Implements four canonical litmus tests, each as an inline-PTX CUDA kernel:
+ *   SB   (Store Buffering) — store-load reordering
+ *   MP   (Message Passing) — store-store / load-load ordering
+ *   LB   (Load Buffering)  — load-store causality cycles
+ *   IRIW (Independent Reads of Independent Writes) — multi-copy atomicity
+ *
+ * Design principles:
+ *   - Array-strided layout: each of the N iterations touches a fresh element,
+ *     eliminating cross-iteration L1 cache pollution.
+ *   - All memory ops are inline PTX volatile to prevent compiler reordering.
+ *   - Every test runs N_RUNS independent times; results include per-run mean
+ *     and stddev, plus a full outcome-distribution histogram.
+ */
+
 #include <iostream>
-#include <map>
 #include <iomanip>
+#include <vector>
+#include <cmath>
+#include <algorithm>
 
 #include <cuda_runtime.h>
 #include <stdio.h>
@@ -18,17 +37,20 @@
         }                                                                 \
     } while (0)
 
+static const int ITERATIONS = 1'000'000;
+static const int N_RUNS = 5;
+
 enum TestSBType : int
 {
-    TEST_SB_WEAK            = 0,
-    TEST_SB_RELAXED_CTA     = 1,
-    TEST_SB_RELAXED_GPU     = 2,
-    TEST_SB_RELAXED_SYS     = 3,
-    TEST_SB_FENCE_SC_GPU    = 4,
-    TEST_SB_FENCE_SC_SYS    = 5,
-    TEST_SB_REL_ACQ_GPU     = 6,
-    TEST_SB_REL_ACQ_SYS     = 7,
-    TEST_SB_ATOMIC_RELAXED  = 8,
+    TEST_SB_WEAK = 0,
+    TEST_SB_RELAXED_CTA = 1,
+    TEST_SB_RELAXED_GPU = 2,
+    TEST_SB_RELAXED_SYS = 3,
+    TEST_SB_FENCE_SC_GPU = 4,
+    TEST_SB_FENCE_SC_SYS = 5,
+    TEST_SB_REL_ACQ_GPU = 6,
+    TEST_SB_REL_ACQ_SYS = 7,
+    TEST_SB_ATOMIC_RELAXED = 8,
 };
 
 enum TestMPType : int
@@ -40,34 +62,42 @@ enum TestMPType : int
     //   P1 (consumer):  r_flag = flag;  r_data = data;
     //
     // "Bad" MP outcome (weak behaviour):  r_flag == 1 && r_data == 0
-    TEST_MP_WEAK            = 0,  // plain ld/st (implicitly .weak)
-    TEST_MP_RELAXED_CTA     = 1,
-    TEST_MP_RELAXED_GPU     = 2,  // relaxed.gpu on both data & flag
-    TEST_MP_RELAXED_SYS     = 3,  // relaxed.sys on both data & flag
-    TEST_MP_REL_ACQ_CTA     = 4,
-    TEST_MP_REL_ACQ_GPU     = 5,  // release store to flag, acquire load of flag (GPU scope)
-    TEST_MP_REL_ACQ_SYS     = 6,  // release/acquire pair on flag (SYS scope)
-    TEST_MP_FENCE_SC_CTA    = 7,
-    TEST_MP_FENCE_SC_GPU    = 8,  // fence.sc.gpu around flag/data
-    TEST_MP_FENCE_SC_SYS    = 9,  // fence.sc.sys around flag/data
-    
+    TEST_MP_WEAK = 0, // plain ld/st (implicitly .weak)
+    TEST_MP_RELAXED_CTA = 1,
+    TEST_MP_RELAXED_GPU = 2, // relaxed.gpu on both data & flag
+    TEST_MP_RELAXED_SYS = 3, // relaxed.sys on both data & flag
+    TEST_MP_REL_ACQ_CTA = 4,
+    TEST_MP_REL_ACQ_GPU = 5, // release store to flag, acquire load of flag (GPU scope)
+    TEST_MP_REL_ACQ_SYS = 6, // release/acquire pair on flag (SYS scope)
+    TEST_MP_FENCE_SC_CTA = 7,
+    TEST_MP_FENCE_SC_GPU = 8, // fence.sc.gpu around flag/data
+    TEST_MP_FENCE_SC_SYS = 9, // fence.sc.sys around flag/data
 };
 
 enum TestLBType : int
 {
-    TEST_LB_WEAK            = 0,
-    TEST_LB_RELAXED_CTA     = 1,
-    TEST_LB_RELAXED_GPU     = 2,
-    TEST_LB_RELAXED_SYS     = 3,
-    TEST_LB_ACQ_REL_GPU     = 4, // Load Acquire, Store Release
-    TEST_LB_FENCE_SC_GPU    = 5,
+    TEST_LB_WEAK = 0,
+    TEST_LB_RELAXED_CTA = 1,
+    TEST_LB_RELAXED_GPU = 2,
+    TEST_LB_RELAXED_SYS = 3,
+    TEST_LB_ACQ_REL_GPU = 4, // Load Acquire, Store Release
+    TEST_LB_FENCE_SC_GPU = 5,
+};
+
+enum TestIRIWType : int
+{
+    TEST_IRIW_WEAK = 0,         // plain .weak st/ld
+    TEST_IRIW_RELAXED_GPU = 1,  // relaxed.gpu
+    TEST_IRIW_REL_ACQ_GPU = 2,  // writers: release.gpu; readers: acquire.gpu between loads
+    TEST_IRIW_FENCE_SC_GPU = 3, // fence.sc.gpu between the two reader loads
+    TEST_IRIW_FENCE_SC_SYS = 4, // fence.sc.sys
 };
 
 enum ScopeStrategy
 {
     SCOPE_CTA = 0, // Threads in the same block (different warps)
     SCOPE_GPU = 1, // Threads in different blocks
-    SCOPE_SYS = 2  // 
+    SCOPE_SYS = 2  //
 };
 
 // --- WEAK (Default) ---
@@ -85,27 +115,25 @@ __device__ __forceinline__ int ptx_ld_weak(int *addr)
 }
 
 // --- RELAXED ---
-// 
+//
 __device__ __forceinline__ void ptx_st_relaxed(int *addr, int val, int scope)
 {
-    if (scope == SCOPE_CTA) {
+    if (scope == SCOPE_CTA)
         asm volatile("st.global.relaxed.cta.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    } else if (scope == SCOPE_GPU) {
+    else if (scope == SCOPE_GPU)
         asm volatile("st.global.relaxed.gpu.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    } else {
+    else
         asm volatile("st.global.relaxed.sys.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    }
 }
 __device__ __forceinline__ int ptx_ld_relaxed(int *addr, int scope)
 {
     int val;
-    if (scope == SCOPE_CTA) {
+    if (scope == SCOPE_CTA)
         asm volatile("ld.global.relaxed.cta.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    } else if (scope == SCOPE_GPU) {
+    else if (scope == SCOPE_GPU)
         asm volatile("ld.global.relaxed.gpu.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    } else {
+    else
         asm volatile("ld.global.relaxed.sys.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    }
     return val;
 }
 
@@ -113,13 +141,12 @@ __device__ __forceinline__ int ptx_ld_relaxed(int *addr, int scope)
 // All previous writes/stores are visible before this write/store
 __device__ __forceinline__ void ptx_st_release(int *addr, int val, int scope)
 {
-    if (scope == SCOPE_CTA) {
+    if (scope == SCOPE_CTA)
         asm volatile("st.global.release.cta.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    } else if (scope == SCOPE_GPU) {
+    else if (scope == SCOPE_GPU)
         asm volatile("st.global.release.gpu.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    } else {
+    else
         asm volatile("st.global.release.sys.u32 [%0], %1;" ::"l"(addr), "r"(val) : "memory");
-    }
 }
 
 // --- ACQUIRE (Read) ---
@@ -127,45 +154,53 @@ __device__ __forceinline__ void ptx_st_release(int *addr, int val, int scope)
 __device__ __forceinline__ int ptx_ld_acquire(int *addr, int scope)
 {
     int val;
-    if (scope == SCOPE_CTA) {
+    if (scope == SCOPE_CTA)
         asm volatile("ld.global.acquire.cta.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    } else if (scope == SCOPE_GPU) {
+    else if (scope == SCOPE_GPU)
         asm volatile("ld.global.acquire.gpu.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    } else {
+    else
         asm volatile("ld.global.acquire.sys.u32 %0, [%1];" : "=r"(val) : "l"(addr) : "memory");
-    }
     return val;
 }
 
 // --- ATOMIC EXCHANGE (RELAXED) ---
 __device__ __forceinline__ void ptx_atom_exch_relaxed(int *addr, int val, int scope)
 {
-    if (scope == SCOPE_CTA) {
-        asm volatile("atom.global.relaxed.cta.exch.b32 %0, [%1], %2;" : "=r"(val) : "l"(addr), "r"(val) : "memory");
-    } else if (scope == SCOPE_GPU) {
-        asm volatile("atom.global.relaxed.gpu.exch.b32 %0, [%1], %2;" : "=r"(val) : "l"(addr), "r"(val) : "memory");
-    } else {
-        asm volatile("atom.global.relaxed.sys.exch.b32 %0, [%1], %2;" : "=r"(val) : "l"(addr), "r"(val) : "memory");
-    }
+    if (scope == SCOPE_CTA)
+        asm volatile("atom.global.relaxed.cta.exch.b32 %0, [%1], %2;"
+                     : "=r"(val) : "l"(addr), "r"(val) : "memory");
+    else if (scope == SCOPE_GPU)
+        asm volatile("atom.global.relaxed.gpu.exch.b32 %0, [%1], %2;"
+                     : "=r"(val) : "l"(addr), "r"(val) : "memory");
+    else
+        asm volatile("atom.global.relaxed.sys.exch.b32 %0, [%1], %2;"
+                     : "=r"(val) : "l"(addr), "r"(val) : "memory");
 }
 
 // --- FENCE ---
-__device__ __forceinline__ void ptx_fence_sc_cta() {
+// Sequential-consistency fences at each scope.
+// Maps to MEMBAR.CTA / MEMBAR.GL / MEMBAR.SYS in SASS.
+__device__ __forceinline__ void ptx_fence_sc_cta()
+{
     asm volatile("fence.sc.cta;" ::: "memory");
 }
-__device__ __forceinline__ void ptx_fence_sc_gpu() {
+__device__ __forceinline__ void ptx_fence_sc_gpu()
+{
     asm volatile("fence.sc.gpu;" ::: "memory");
 }
-__device__ __forceinline__ void ptx_fence_sc_sys() {
+__device__ __forceinline__ void ptx_fence_sc_sys()
+{
     asm volatile("fence.sc.sys;" ::: "memory");
 }
 
 // strong barrier to prevent caching effect. global-synchronization point.
-__device__ void global_spin_barrier(volatile int* barrier, int val_to_wait_for) {
+__device__ void global_spin_barrier(volatile int *barrier, int val_to_wait_for)
+{
     // Thread 0 of participating blocks call this.
     // Simple arrival count.
-    atomicAdd((int*)barrier, 1);
-    while (*barrier < val_to_wait_for);
+    atomicAdd((int *)barrier, 1);
+    while (*barrier < val_to_wait_for)
+        ;
 }
 
 /*
@@ -174,27 +209,33 @@ the reason is the if (tid==0) part, which will activate only one lane when execu
 */
 
 // Helper to determine thread roles without divergence in critical path
-__device__ __forceinline__ void get_roles(bool inter_block, bool &is_p0, bool &is_p1) {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    is_p0 = false;
-    is_p1 = false;
-
-    if (inter_block) {
-        // Block 0 Thread 0 vs Block 1 Thread 0
-        if (tid == 0 && bid == 0) is_p0 = true;
-        if (tid == 0 && bid == 1) is_p1 = true;
-    } else {
-        // Thread 0 vs Thread 32 (Same Block)
-        if (bid == 0) {
-            if (tid == 0) is_p0 = true;
-            if (tid == 32) is_p1 = true;
+__device__ __forceinline__ void get_roles(bool inter_block, bool &is_p0, bool &is_p1)
+{
+    int tid = threadIdx.x, bid = blockIdx.x;
+    is_p0 = is_p1 = false;
+    if (inter_block)
+    {
+        // Different SMs: block 0 tid 0 = P0, block 1 tid 0 = P1
+        if (tid == 0 && bid == 0)
+            is_p0 = true;
+        if (tid == 0 && bid == 1)
+            is_p1 = true;
+    }
+    else
+    {
+        // Same SM, different warps: tid 0 = P0, tid 32 = P1 (avoids lockstep)
+        if (bid == 0)
+        {
+            if (tid == 0)
+                is_p0 = true;
+            if (tid == 32)
+                is_p1 = true;
         }
     }
 }
 
-// Currently not used. 
-// Synchronize Reset data x and y to 0 at the start of each iteration. when x y is not an array, weirdly, this could give fence sc a weak sb behaviour. 
+// Currently not used.
+// Synchronize Reset data x and y to 0 at the start of each iteration. when x y is not an array, weirdly, this could give fence sc a weak sb behaviour.
 // TODO: Test more barriers
 // __device__ __forceinline__ void reset_behavior(bool inter_block, int tid, int idx, int* sync_barrier, int* x, int* y) {
 //     if (inter_block) {
@@ -222,11 +263,71 @@ __device__ __forceinline__ void get_roles(bool inter_block, bool &is_p0, bool &i
 //     }
 // }
 
+struct Hist2
+{
+    long long c[2][2];
+    Hist2() { c[0][0] = c[0][1] = c[1][0] = c[1][1] = 0; }
+    void record(int r0, int r1)
+    {
+        if (r0 >= 0 && r0 <= 1 && r1 >= 0 && r1 <= 1)
+            c[r0][r1]++;
+    }
+    long long total() const { return c[0][0] + c[0][1] + c[1][0] + c[1][1]; }
+    Hist2 &operator+=(const Hist2 &o)
+    {
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+                c[i][j] += o.c[i][j];
+        return *this;
+    }
+};
 
+struct Stats
+{
+    double mean, stddev, mn, mx;
+};
 
+static Stats compute_stats(const std::vector<double> &v)
+{
+    double s = 0, s2 = 0, mn = v[0], mx = v[0];
+    for (double x : v)
+    {
+        s += x;
+        s2 += x * x;
+        mn = std::min(mn, x);
+        mx = std::max(mx, x);
+    }
+    int n = (int)v.size();
+    double m = s / n;
+    double var = std::max(0.0, s2 / n - m * m);
+    return {m, std::sqrt(var), mn, mx};
+}
+
+static void print_hist2(const Hist2 &h,
+                        const char *r0_lbl, const char *r1_lbl,
+                        bool w00, bool w10, bool w01, bool w11)
+{
+    long long tot = h.total();
+    if (tot == 0)
+    {
+        printf("    (no observations)\n");
+        return;
+    }
+    printf("  (%s, %s) distribution — %lld total obs (%d runs):\n",
+           r0_lbl, r1_lbl, tot, N_RUNS);
+    auto row = [&](int r0, int r1, bool is_weak)
+    {
+        printf("    (%d, %d)%s : %9lld  (%8.4f%%)\n",
+               r0, r1, is_weak ? "*" : " ", h.c[r0][r1], 100.0 * h.c[r0][r1] / tot);
+    };
+    row(0, 0, w00);
+    row(0, 1, w01);
+    row(1, 0, w10);
+    row(1, 1, w11);
+}
 
 /*
-Store Buffering (SB) kernel. 
+Store Buffering (SB) kernel.
 non-atomic
 weak load/store
 
@@ -235,171 +336,126 @@ p1: y = 1; r1 = x;
 
 Weak behaviour: r0 = r1 = 0
 */
-__global__ void sb_kernel_litmus_test(int *arr_x, int *arr_y,
-                                     int *result_0, int *result_1,
-                                     int iterations,
-                                     int variant,
-                                     bool inter_block)
+
+__global__ void sb_kernel(int *arr_x, int *arr_y,
+                          int *result_0, int *result_1,
+                          int iterations, int variant, bool inter_block)
 {
-    // Thread Identification: 
+    // Thread Identification:
     // Inter-block: Block 0 is P0, Block 1 is P1. Thread 0 of each block acts.
     // Intra-block: Thread 0 is P0, Thread 32 (next warp) is P1.
     bool is_p0, is_p1;
     get_roles(inter_block, is_p0, is_p1);
-    
-    if (!is_p0 && !is_p1) return;
+
+    if (!is_p0 && !is_p1)
+        return;
 
     for (int i = 0; i < iterations; ++i)
     {
-        int idx = i;
-        int* addr_x = &arr_x[idx];
-        int* addr_y = &arr_y[idx];
+        int *ax = &arr_x[i], *ay = &arr_y[i];
+        int r0 = -1, r1 = -1;
 
-        int r0 = -1;
-        int r1 = -1;
-        // P0
-        if (is_p0) {
-
-            switch (variant) {
-                case TEST_SB_WEAK:  // Weak
-                    ptx_st_weak(addr_x, 1);
-                    r0 = ptx_ld_weak(addr_y);
-                    break;
-                case TEST_SB_RELAXED_CTA:
-                    ptx_st_relaxed(addr_x, 1, SCOPE_CTA); // Too weak for Inter-block
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_CTA);
-                    break;
-                case TEST_SB_RELAXED_GPU:
-                    ptx_st_relaxed(addr_x, 1, SCOPE_GPU);
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_GPU);
-                    break;
-                case TEST_SB_RELAXED_SYS:
-                    ptx_st_relaxed(addr_x, 1, SCOPE_SYS);
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_SYS);
-                    break;
-                case TEST_SB_FENCE_SC_GPU:
-                    ptx_st_relaxed(addr_x, 1, SCOPE_GPU);
-                    ptx_fence_sc_gpu(); // CRITICAL: Store-Load Fence
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_GPU);
-                    break;
-                case TEST_SB_FENCE_SC_SYS:
-                    ptx_st_relaxed(addr_x, 1, SCOPE_SYS);
-                    ptx_fence_sc_sys(); // Strongest fence
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_SYS);
-                    break;
-                case TEST_SB_REL_ACQ_GPU:
-                    // Release store, Acquire load.
-                    // IMPORTANT: This provides Store-Store and Load-Load ordering,
-                    // but NOT Store-Load ordering. SB should still FAIL.
-                    ptx_st_release(addr_x, 1, SCOPE_GPU);
-                    r0 = ptx_ld_acquire(addr_y, SCOPE_GPU);
-                    break;
-                case TEST_SB_REL_ACQ_SYS:
-                    // Release store, Acquire load.
-                    // IMPORTANT: This provides Store-Store and Load-Load ordering,
-                    // but NOT Store-Load ordering. SB should still FAIL.
-                    ptx_st_release(addr_x, 1, SCOPE_SYS);
-                    r0 = ptx_ld_acquire(addr_y, SCOPE_SYS);
-                    break;
-                case TEST_SB_ATOMIC_RELAXED:
-                    ptx_atom_exch_relaxed(addr_x, 1, SCOPE_GPU);
-                    r0 = ptx_ld_relaxed(addr_y, SCOPE_GPU);
-                    break;
+        if (is_p0)
+        {
+            switch (variant)
+            {
+            case TEST_SB_WEAK:
+                ptx_st_weak(ax, 1);
+                r0 = ptx_ld_weak(ay);
+                break;
+            case TEST_SB_RELAXED_CTA:
+                ptx_st_relaxed(ax, 1, SCOPE_CTA);
+                r0 = ptx_ld_relaxed(ay, SCOPE_CTA);
+                break;
+            case TEST_SB_RELAXED_GPU:
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                r0 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
+            case TEST_SB_RELAXED_SYS:
+                ptx_st_relaxed(ax, 1, SCOPE_SYS);
+                r0 = ptx_ld_relaxed(ay, SCOPE_SYS);
+                break;
+            case TEST_SB_FENCE_SC_GPU:
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                r0 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
+            case TEST_SB_FENCE_SC_SYS:
+                ptx_st_relaxed(ax, 1, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                r0 = ptx_ld_relaxed(ay, SCOPE_SYS);
+                break;
+            case TEST_SB_REL_ACQ_GPU:
+                // Release store, Acquire load.
+                // IMPORTANT: This provides Store-Store and Load-Load ordering,
+                // but NOT Store-Load ordering. SB should still FAIL.
+                ptx_st_release(ax, 1, SCOPE_GPU);
+                r0 = ptx_ld_acquire(ay, SCOPE_GPU);
+                break;
+            case TEST_SB_REL_ACQ_SYS:
+                // Release store, Acquire load.
+                // IMPORTANT: This provides Store-Store and Load-Load ordering,
+                // but NOT Store-Load ordering. SB should still FAIL.
+                ptx_st_release(ax, 1, SCOPE_SYS);
+                r0 = ptx_ld_acquire(ay, SCOPE_SYS);
+                break;
+            case TEST_SB_ATOMIC_RELAXED:
+                ptx_atom_exch_relaxed(ax, 1, SCOPE_GPU);
+                r0 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
             }
-
             result_0[i] = r0;
         }
-
         // P1  // P1: Store Y, Load X
-        if (is_p1) {
-
-            int* addr_x = &arr_x[idx];
-            int* addr_y = &arr_y[idx];
-            switch (variant) {
-                case TEST_SB_WEAK:
-                    ptx_st_weak(addr_y, 1);
-                    r1 = ptx_ld_weak(addr_x);
-                    break;
-                case TEST_SB_RELAXED_CTA:
-                    ptx_st_relaxed(addr_y, 1, SCOPE_CTA);
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_CTA);
-                    break;
-                case TEST_SB_RELAXED_GPU:
-                    ptx_st_relaxed(addr_y, 1, SCOPE_GPU);
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_GPU);
-                    break;
-                case TEST_SB_RELAXED_SYS:
-                    ptx_st_relaxed(addr_y, 1, SCOPE_SYS);
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_SYS);
-                    break;
-                case TEST_SB_FENCE_SC_GPU:
-                    ptx_st_relaxed(addr_y, 1, SCOPE_GPU);
-                    ptx_fence_sc_gpu();
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_GPU);
-                    break;
-                case TEST_SB_FENCE_SC_SYS:
-                    ptx_st_relaxed(addr_y, 1, SCOPE_SYS);
-                    ptx_fence_sc_sys();
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_SYS);
-                    break;
-                case TEST_SB_REL_ACQ_GPU:
-                    ptx_st_release(addr_y, 1, SCOPE_GPU);
-                    r1 = ptx_ld_acquire(addr_x, SCOPE_GPU);
-                    break;
-                case TEST_SB_REL_ACQ_SYS:
-                    ptx_st_release(addr_y, 1, SCOPE_SYS);
-                    r1 = ptx_ld_acquire(addr_x, SCOPE_SYS);
-                    break;
-                case TEST_SB_ATOMIC_RELAXED:
-                    ptx_atom_exch_relaxed(addr_y, 1, SCOPE_GPU);
-                    r1 = ptx_ld_relaxed(addr_x, SCOPE_GPU);
-                    break;
+        if (is_p1)
+        {
+            switch (variant)
+            {
+            case TEST_SB_WEAK:
+                ptx_st_weak(ay, 1);
+                r1 = ptx_ld_weak(ax);
+                break;
+            case TEST_SB_RELAXED_CTA:
+                ptx_st_relaxed(ay, 1, SCOPE_CTA);
+                r1 = ptx_ld_relaxed(ax, SCOPE_CTA);
+                break;
+            case TEST_SB_RELAXED_GPU:
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                r1 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
+            case TEST_SB_RELAXED_SYS:
+                ptx_st_relaxed(ay, 1, SCOPE_SYS);
+                r1 = ptx_ld_relaxed(ax, SCOPE_SYS);
+                break;
+            case TEST_SB_FENCE_SC_GPU:
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                r1 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
+            case TEST_SB_FENCE_SC_SYS:
+                ptx_st_relaxed(ay, 1, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                r1 = ptx_ld_relaxed(ax, SCOPE_SYS);
+                break;
+            case TEST_SB_REL_ACQ_GPU:
+                ptx_st_release(ay, 1, SCOPE_GPU);
+                r1 = ptx_ld_acquire(ax, SCOPE_GPU);
+                break;
+            case TEST_SB_REL_ACQ_SYS:
+                ptx_st_release(ay, 1, SCOPE_SYS);
+                r1 = ptx_ld_acquire(ax, SCOPE_SYS);
+                break;
+            case TEST_SB_ATOMIC_RELAXED:
+                ptx_atom_exch_relaxed(ay, 1, SCOPE_GPU);
+                r1 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
             }
             result_1[i] = r1;
         }
-        
         // Very basic delay to shift phases (helps mitigate lockstep)
-        // for(volatile int k=0; k<100; k++); 
+        // for(volatile int k=0; k<100; k++);
     }
 }
-
-void run_sb_test(int iterations, bool inter_block, int variant, const char* label) {
-    int *d_x, *d_y, *d_r0, *d_r1;
-    // int *d_barrier;
-    int *h_r0 = new int[iterations];
-    int *h_r1 = new int[iterations];
-
-    cudaMalloc(&d_x, iterations * sizeof(int));
-    cudaMalloc(&d_y, iterations * sizeof(int));
-    cudaMalloc(&d_r0, iterations * sizeof(int));
-    cudaMalloc(&d_r1, iterations * sizeof(int));
-    // cudaMalloc(&d_barrier, sizeof(int));
-
-    cudaMemset(d_x, 0, iterations * sizeof(int));
-    cudaMemset(d_y, 0, iterations * sizeof(int));
-
-    int blocks = inter_block ? 2 : 1;
-    sb_kernel_litmus_test<<<blocks, 64>>>(d_x, d_y, d_r0, d_r1, iterations, variant, inter_block);
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(h_r0, d_r0, iterations * sizeof(int), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_r1, d_r1, iterations * sizeof(int), cudaMemcpyDeviceToHost);
-
-    int weak = 0;
-    for(int i=0; i<iterations; i++) {
-        // weak behaviour: both see initialization value (0)
-        if(h_r0[i] == 0 && h_r1[i] == 0) weak++;
-    }
-
-    std::cout << std::left << std::setw(30) << label 
-              << "| Weak: " << std::setw(6) << weak 
-              << "(" << std::fixed << std::setprecision(2) << (100.0 * weak / iterations) << "%)\n";
-
-    cudaFree(d_x); cudaFree(d_y); cudaFree(d_r0); cudaFree(d_r1);
-    // cudaFree(d_barrier);
-    delete[] h_r0; delete[] h_r1;
-}
-
 
 /*
  * Message Passing (MP) kernel.
@@ -433,485 +489,663 @@ void run_sb_test(int iterations, bool inter_block, int variant, const char* labe
  *       block 0, thread 0  -> P0
  *       block 0, thread 32 -> P1 (different warp to avoid lockstep effects)
  */
-__global__ void mp_kernel_litmus_test(int *x, int *y,
-                                      int *result_0, int *result_1,
-                                      int *sync_barrier,
-                                      int iterations,
-                                      int variant,
-                                      bool inter_block)
+__global__ void mp_kernel(int *arr_data, int *arr_flag,
+                          int *result_flag, int *result_data,
+                          int iterations, int variant, bool inter_block)
 {
     // Identify which CUDA thread plays which logical role.
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-
-    bool is_p0 = false;  // producer
-    bool is_p1 = false;  // consumer
-
-    if (inter_block) {
-        // Two-block setup: one logical thread per block.
-        if (tid == 0 && bid == 0) is_p0 = true;
-        if (tid == 0 && bid == 1) is_p1 = true;
-    } else {
-        // Single-block setup: use different warps inside the same CTA.
-        if (bid == 0) {
-            if (tid == 0)  is_p0 = true;
-            if (tid == 32) is_p1 = true;  // different warp to reduce lockstep bias
-        }
-    }
-
+    bool is_p0, is_p1;
+    get_roles(inter_block, is_p0, is_p1);
     if (!is_p0 && !is_p1)
-        return;  // all other threads idle
-
-    // Aliases for clarity
-    int *data = x;
-    int *flag = y;
+        return;
 
     for (int i = 0; i < iterations; ++i)
     {
-        // Reset data and flag to 0 at the start of each iteration
-        if (inter_block) {
-            if (is_p0) {
-                // Only P0 resets the shared variables.
-                // __threadfence() ensures the reset is visible to P1
-                // before it moves on to the MP pattern.
-                *data = 0;
-                *flag = 0;
-                __threadfence();
-            }
-            // Both P0 and P1 participate in the global spin barrier.
-            // Each iteration uses a larger threshold so the arrival counter
-            // monotonically increases.
-            global_spin_barrier(sync_barrier, (i * 2) + 2);
-        } else {
-            // Intra-CTA setup: block-level reset.
-            __syncthreads();  // ensure previous iteration's work is done
-            if (tid == 0) {
-                *data = 0;
-                *flag = 0;
-            }
-            __syncthreads();         // make reset visible inside CTA
-            __threadfence_block();   // order writes within the block
-        }
+        int *data = &arr_data[i], *flag = &arr_flag[i];
+        int r_flag = -1, r_data = -1;
 
-        int r_flag = -1;
-        int r_data = -1;
-
-        // Producer
-        if (is_p0) {
-            switch (variant) {
-                case TEST_MP_WEAK:
-                    // Plain global stores (implicitly .weak), no ordering or synchronisation guarantees
-                    ptx_st_weak(data, 1);
-                    ptx_st_weak(flag, 1);
-                    break;
-
-                case TEST_MP_RELAXED_CTA:
-                    ptx_st_relaxed(data, 1, SCOPE_CTA);
-                    ptx_st_relaxed(flag, 1, SCOPE_CTA);
-                    break;
-
-                case TEST_MP_RELAXED_GPU:
-                    // Strong relaxed stores at GPU scope.
-                    // They participate in the memory model but do NOT
-                    // enforce any particular cross-thread ordering.
-                    ptx_st_relaxed(data, 1, SCOPE_GPU);
-                    ptx_st_relaxed(flag, 1, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_RELAXED_SYS:
-                    // Same as above but system scope (host/other GPUs).
-                    ptx_st_relaxed(data, 1, SCOPE_SYS);
-                    ptx_st_relaxed(flag, 1, SCOPE_SYS);
-                    break;
-
-                case TEST_MP_REL_ACQ_CTA:
-                    ptx_st_relaxed(data, 1, SCOPE_CTA);
-                    ptx_st_release(flag, 1, SCOPE_CTA);
-                    break;
-
-                case TEST_MP_REL_ACQ_GPU:
-                    // Classic message-passing with release:
-                    //
-                    //   data = 1          (relaxed)
-                    //   flag = 1 (release.gpu)
-                    //
-                    // The PTX model guarantees that if a GPU-scope acquire
-                    // load of 'flag' sees the 1, then all prior writes
-                    // (including to 'data') become visible at GPU scope.
-                    ptx_st_relaxed(data, 1, SCOPE_GPU);
-                    ptx_st_release(flag, 1, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_REL_ACQ_SYS:
-                    // Same, but system-scope: this is what you'd use if
-                    // the host or another GPU also participates.
-                    ptx_st_relaxed(data, 1, SCOPE_SYS);
-                    ptx_st_release(flag, 1, SCOPE_SYS);
-                    break;
-                    
-                case TEST_MP_FENCE_SC_CTA:
-                    ptx_st_relaxed(data, 1, SCOPE_CTA);
-                    // You'd need a CTA-scope SC fence here if you want to test that variant,
-                    // or map it to __threadfence_block() + __syncthreads().
-                    break;
-
-                case TEST_MP_FENCE_SC_GPU:
-                    // Fence-based message passing (device scope):
-                    //
-                    //   data = 1 (relaxed.gpu)
-                    //   fence.sc.gpu
-                    //   flag = 1 (relaxed.gpu)
-                    //
-                    // A matching fence on the consumer side enforces an
-                    // SC-like ordering at GPU scope, so observing flag==1
-                    // should imply seeing data==1.
-                    ptx_st_relaxed(data, 1, SCOPE_GPU);
-                    ptx_fence_sc_gpu();
-                    ptx_st_relaxed(flag, 1, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_FENCE_SC_SYS:
-                    // Same idea with system-scope SC fences.
-                    ptx_st_relaxed(data, 1, SCOPE_SYS);
-                    ptx_fence_sc_sys();
-                    ptx_st_relaxed(flag, 1, SCOPE_SYS);
-                    break;
+        if (is_p0)
+        {
+            switch (variant)
+            {
+            case TEST_MP_WEAK:
+                // Plain global stores (implicitly .weak), no ordering or synchronisation guarantees
+                ptx_st_weak(data, 1);
+                ptx_st_weak(flag, 1);
+                break;
+            case TEST_MP_RELAXED_CTA:
+                ptx_st_relaxed(data, 1, SCOPE_CTA);
+                ptx_st_relaxed(flag, 1, SCOPE_CTA);
+                break;
+            case TEST_MP_RELAXED_GPU:
+                ptx_st_relaxed(data, 1, SCOPE_GPU);
+                ptx_st_relaxed(flag, 1, SCOPE_GPU);
+                break;
+            case TEST_MP_RELAXED_SYS:
+                ptx_st_relaxed(data, 1, SCOPE_SYS);
+                ptx_st_relaxed(flag, 1, SCOPE_SYS);
+                break;
+            case TEST_MP_REL_ACQ_CTA:
+                ptx_st_relaxed(data, 1, SCOPE_CTA);
+                ptx_st_release(flag, 1, SCOPE_CTA);
+                break;
+            case TEST_MP_REL_ACQ_GPU:
+                // Release store to flag ensures data write is visible
+                // before flag becomes visible to any GPU-scope acquire reader.
+                ptx_st_relaxed(data, 1, SCOPE_GPU);
+                ptx_st_release(flag, 1, SCOPE_GPU);
+                break;
+            case TEST_MP_REL_ACQ_SYS:
+                ptx_st_relaxed(data, 1, SCOPE_SYS);
+                ptx_st_release(flag, 1, SCOPE_SYS);
+                break;
+            case TEST_MP_FENCE_SC_CTA:
+                ptx_st_relaxed(data, 1, SCOPE_CTA);
+                ptx_fence_sc_cta();
+                ptx_st_relaxed(flag, 1, SCOPE_CTA); 
+                break;
+            case TEST_MP_FENCE_SC_GPU:
+                ptx_st_relaxed(data, 1, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                ptx_st_relaxed(flag, 1, SCOPE_GPU);
+                break;
+            case TEST_MP_FENCE_SC_SYS:
+                ptx_st_relaxed(data, 1, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                ptx_st_relaxed(flag, 1, SCOPE_SYS);
+                break;
             }
         }
 
-        // Consumer
-        if (is_p1) {
-            switch (variant) {
-                case TEST_MP_WEAK:
-                    // Plain weak loads: hardware is free to reorder or
-                    // delay visibility. MP can fail: flag==1, data==0.
-                    r_flag = ptx_ld_weak(flag);
-                    r_data = ptx_ld_weak(data);
-                    break;
-                
-                case TEST_MP_RELAXED_CTA:
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_CTA);
-                    r_data = ptx_ld_relaxed(data, SCOPE_CTA);
-                    break;
-
-                case TEST_MP_RELAXED_GPU:
-                    // Strong relaxed loads at GPU scope, but no ordering.
-                    // MP is still allowed to fail: the flag write can become
-                    // visible before the data write.
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_GPU);
-                    r_data = ptx_ld_relaxed(data, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_RELAXED_SYS:
-                    // Same semantics, wider scope.
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_SYS);
-                    r_data = ptx_ld_relaxed(data, SCOPE_SYS);
-                    break;
-                
-                case TEST_MP_REL_ACQ_CTA:
-                    r_flag = ptx_ld_acquire(flag, SCOPE_CTA);
-                    r_data = ptx_ld_acquire(data, SCOPE_CTA);
-                    break;
-
-                case TEST_MP_REL_ACQ_GPU:
-                    // Acquire on the flag, relaxed on data:
-                    //
-                    //   r_flag = ld.acquire.gpu(flag)
-                    //   r_data = ld.relaxed.gpu(data)
-                    //
-                    // If r_flag == 1 and that 1 comes from the producer's
-                    // release store, the PTX model guarantees that r_data
-                    // must see data==1 at GPU scope.
-                    r_flag = ptx_ld_acquire(flag, SCOPE_GPU);
-                    r_data = ptx_ld_relaxed(data, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_REL_ACQ_SYS:
-                    // Same with system-scope acquire.
-                    r_flag = ptx_ld_acquire(flag, SCOPE_SYS);
-                    r_data = ptx_ld_relaxed(data, SCOPE_SYS);
-                    break;
-                
-                case TEST_MP_FENCE_SC_CTA:
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_CTA);
-                    ptx_fence_sc_cta();    // need a CTA-scope SC fence here or map it to __threadfence_block() + __syncthreads().
-                    r_data = ptx_ld_relaxed(data, SCOPE_CTA);
-                    break;
-
-                case TEST_MP_FENCE_SC_GPU:
-                    // Fence-based message passing on the consumer:
-                    //
-                    //   r_flag = ld.relaxed.gpu(flag)
-                    //   fence.sc.gpu
-                    //   r_data = ld.relaxed.gpu(data)
-                    //
-                    // Together with the producer's fence, this enforces
-                    // SC at GPU scope for these operations.
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_GPU);
-                    ptx_fence_sc_gpu();
-                    r_data = ptx_ld_relaxed(data, SCOPE_GPU);
-                    break;
-
-                case TEST_MP_FENCE_SC_SYS:
-                    // System-scope fence variant.
-                    r_flag = ptx_ld_relaxed(flag, SCOPE_SYS);
-                    ptx_fence_sc_sys();
-                    r_data = ptx_ld_relaxed(data, SCOPE_SYS);
-                    break;
+        if (is_p1)
+        {
+            switch (variant)
+            {
+            case TEST_MP_WEAK:
+                r_flag = ptx_ld_weak(flag);
+                r_data = ptx_ld_weak(data);
+                break;
+            case TEST_MP_RELAXED_CTA:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_CTA);
+                r_data = ptx_ld_relaxed(data, SCOPE_CTA);
+                break;
+            case TEST_MP_RELAXED_GPU:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_GPU);
+                r_data = ptx_ld_relaxed(data, SCOPE_GPU);
+                break;
+            case TEST_MP_RELAXED_SYS:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_SYS);
+                r_data = ptx_ld_relaxed(data, SCOPE_SYS);
+                break;
+            case TEST_MP_REL_ACQ_CTA:
+                r_flag = ptx_ld_acquire(flag, SCOPE_CTA);
+                r_data = ptx_ld_relaxed(data, SCOPE_CTA);
+                break;
+            case TEST_MP_REL_ACQ_GPU:
+                // Classic message-passing with release:
+                //
+                //   data = 1          (relaxed)
+                //   flag = 1 (release.gpu)
+                //
+                // The PTX model guarantees that if a GPU-scope acquire
+                // load of 'flag' sees the 1, then all prior writes
+                // (including to 'data') become visible at GPU scope.
+                r_flag = ptx_ld_acquire(flag, SCOPE_GPU);
+                r_data = ptx_ld_relaxed(data, SCOPE_GPU);
+                break;
+            case TEST_MP_REL_ACQ_SYS:
+                r_flag = ptx_ld_acquire(flag, SCOPE_SYS);
+                r_data = ptx_ld_relaxed(data, SCOPE_SYS);
+                break;
+            case TEST_MP_FENCE_SC_CTA:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_CTA);
+                ptx_fence_sc_cta();
+                r_data = ptx_ld_relaxed(data, SCOPE_CTA);
+                break;
+            case TEST_MP_FENCE_SC_GPU:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                r_data = ptx_ld_relaxed(data, SCOPE_GPU);
+                break;
+            case TEST_MP_FENCE_SC_SYS:
+                r_flag = ptx_ld_relaxed(flag, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                r_data = ptx_ld_relaxed(data, SCOPE_SYS);
+                break;
             }
-
-            // Store consumer observations for this iteration.
-            result_0[i] = r_flag;
-            result_1[i] = r_data;
+            result_flag[i] = r_flag;
+            result_data[i] = r_data;
         }
-
-        if (inter_block) {
-            // Make sure both producer and consumer have finished their MP
-            // operations before P0 resets data/flag in the next iteration.
-            global_spin_barrier(sync_barrier, (i * 2) + 3);
-        }
-        // (Optional phase shifting could be added here with a small busy loop.)
     }
-}
-
-void run_mp_test(int iterations, bool inter_block, int variant, const char* label) {
-    int *d_data, *d_flag, *d_rf, *d_rd, *d_barrier;
-    int *h_rf = new int[iterations];
-    int *h_rd = new int[iterations];
-
-    CUDA_CHECK(cudaMalloc(&d_data, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_flag, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_rf,   iterations * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_rd,   iterations * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_barrier, sizeof(int)));
-
-    CUDA_CHECK(cudaMemset(d_data, 0, sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_flag, 0, sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_barrier, 0, sizeof(int)));
-
-    int blocks = inter_block ? 2 : 1;
-    mp_kernel_litmus_test<<<blocks, 64>>>(d_data, d_flag, d_rf, d_rd,
-                                          d_barrier, iterations, variant, inter_block);
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_rf, d_rf, iterations * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_rd, d_rd, iterations * sizeof(int), cudaMemcpyDeviceToHost));
-
-    int weak = 0;
-    for (int i = 0; i < iterations; ++i) {
-        // MP weak outcome: flag == 1 but data still 0
-        if (h_rf[i] == 1 && h_rd[i] == 0) weak++;
-    }
-
-    std::cout << std::left << std::setw(30) << label
-              << "| Weak: " << std::setw(6) << weak
-              << "(" << std::fixed << std::setprecision(4)
-              << (100.0 * weak / iterations) << "%)\n";
-
-    cudaFree(d_data); cudaFree(d_flag);
-    cudaFree(d_rf);   cudaFree(d_rd);
-    cudaFree(d_barrier);
-    delete[] h_rf; delete[] h_rd;
 }
 
 /*
  * Load Buffering (LB) Kernel
- * 
+ *
  * Pattern:
  *   Initially x = 0, y = 0
- * 
+ *
  *   P0: r0 = ld(y); st(x, 1);
  *   P1: r1 = ld(x); st(y, 1);
- * 
+ *
  * Weak Behaviour: r0 == 1 && r1 == 1
  * (Requires Load instructions to be reordered with subsequent Store instructions)
  */
-__global__ void lb_kernel_litmus_test(int *arr_x, int *arr_y,
-                                      int *result_0, int *result_1,
-                                      int iterations,
-                                      int variant,
-                                      bool inter_block)
+__global__ void lb_kernel(int *arr_x, int *arr_y,
+                          int *result_0, int *result_1,
+                          int iterations, int variant, bool inter_block)
 {
-    bool is_p0 = false;
-    bool is_p1 = false;
+    bool is_p0, is_p1;
     get_roles(inter_block, is_p0, is_p1);
-
-    if (!is_p0 && !is_p1) return;
+    if (!is_p0 && !is_p1)
+        return;
 
     for (int i = 0; i < iterations; ++i)
     {
-        int *addr_x = &arr_x[i];
-        int *addr_y = &arr_y[i];
+        int *ax = &arr_x[i], *ay = &arr_y[i];
+        int r0 = -1, r1 = -1;
 
-        int r0 = -1;
-        int r1 = -1;
-
-        if (is_p0) {
-            int v = 0;   
-
-            switch (variant) {
-                case TEST_LB_WEAK:
-                    v = ptx_ld_weak(addr_x);
-                    ptx_st_weak(addr_y, v);
-                    break;
-
-                case TEST_LB_RELAXED_CTA:
-                    v = ptx_ld_relaxed(addr_x, SCOPE_CTA);
-                    ptx_st_relaxed(addr_y, v, SCOPE_CTA);
-                    break;
-
-                case TEST_LB_RELAXED_GPU:
-                    v = ptx_ld_relaxed(addr_x, SCOPE_GPU);
-                    ptx_st_relaxed(addr_y, v, SCOPE_GPU);
-                    break;
-
-                case TEST_LB_RELAXED_SYS:
-                    v = ptx_ld_relaxed(addr_x, SCOPE_SYS);
-                    ptx_st_relaxed(addr_y, v, SCOPE_SYS);
-                    break;
-
-                case TEST_LB_ACQ_REL_GPU:
-                    // Load-acquire X, store-release Y
-                    v = ptx_ld_acquire(addr_x, SCOPE_GPU);
-                    ptx_st_release(addr_y, v, SCOPE_GPU);
-                    break;
-
-                case TEST_LB_FENCE_SC_GPU:
-                    // Fence-based ordering: ld(X); fence; st(Y)
-                    v = ptx_ld_relaxed(addr_x, SCOPE_GPU);
-                    ptx_fence_sc_gpu();
-                    ptx_st_relaxed(addr_y, v, SCOPE_GPU);
-                    break;
+        if (is_p0)
+        {
+            switch (variant)
+            {
+            case TEST_LB_WEAK:
+                r0 = ptx_ld_weak(ay);
+                ptx_st_weak(ax, 1);
+                break;
+            case TEST_LB_RELAXED_CTA:
+                r0 = ptx_ld_relaxed(ay, SCOPE_CTA);
+                ptx_st_relaxed(ax, 1, SCOPE_CTA);
+                break;
+            case TEST_LB_RELAXED_GPU:
+                r0 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                break;
+            case TEST_LB_RELAXED_SYS:
+                r0 = ptx_ld_relaxed(ay, SCOPE_SYS);
+                ptx_st_relaxed(ax, 1, SCOPE_SYS);
+                break;
+            case TEST_LB_ACQ_REL_GPU:
+                // Acquire load then release store: prevents load-load and
+                // store-store reordering, but a causality cycle still requires
+                // an additional global ordering guarantee.
+                r0 = ptx_ld_acquire(ay, SCOPE_GPU);
+                ptx_st_release(ax, 1, SCOPE_GPU);
+                break;
+            case TEST_LB_FENCE_SC_GPU:
+                r0 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                break;
             }
-
-            r0 = v;
             result_0[i] = r0;
         }
 
-        if (is_p1) {
-            int v = 0;
-
-            switch (variant) {
-                case TEST_LB_WEAK:
-                    v = ptx_ld_weak(addr_y);
-                    ptx_st_weak(addr_x, v);
-                    break;
-
-                case TEST_LB_RELAXED_CTA:
-                    v = ptx_ld_relaxed(addr_y, SCOPE_CTA);
-                    ptx_st_relaxed(addr_x, v, SCOPE_CTA);
-                    break;
-
-                case TEST_LB_RELAXED_GPU:
-                    v = ptx_ld_relaxed(addr_y, SCOPE_GPU);
-                    ptx_st_relaxed(addr_x, v, SCOPE_GPU);
-                    break;
-
-                case TEST_LB_RELAXED_SYS:
-                    v = ptx_ld_relaxed(addr_y, SCOPE_SYS);
-                    ptx_st_relaxed(addr_x, v, SCOPE_SYS);
-                    break;
-
-                case TEST_LB_ACQ_REL_GPU:
-                    v = ptx_ld_acquire(addr_y, SCOPE_GPU);
-                    ptx_st_release(addr_x, v, SCOPE_GPU);
-                    break;
-
-                case TEST_LB_FENCE_SC_GPU:
-                    v = ptx_ld_relaxed(addr_y, SCOPE_GPU);
-                    ptx_fence_sc_gpu();
-                    ptx_st_relaxed(addr_x, v, SCOPE_GPU);
-                    break;
+        if (is_p1)
+        {
+            switch (variant)
+            {
+            case TEST_LB_WEAK:
+                r1 = ptx_ld_weak(ax);
+                ptx_st_weak(ay, 1);
+                break;
+            case TEST_LB_RELAXED_CTA:
+                r1 = ptx_ld_relaxed(ax, SCOPE_CTA);
+                ptx_st_relaxed(ay, 1, SCOPE_CTA);
+                break;
+            case TEST_LB_RELAXED_GPU:
+                r1 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                break;
+            case TEST_LB_RELAXED_SYS:
+                r1 = ptx_ld_relaxed(ax, SCOPE_SYS);
+                ptx_st_relaxed(ay, 1, SCOPE_SYS);
+                break;
+            case TEST_LB_ACQ_REL_GPU:
+                r1 = ptx_ld_acquire(ax, SCOPE_GPU);
+                ptx_st_release(ay, 1, SCOPE_GPU);
+                break;
+            case TEST_LB_FENCE_SC_GPU:
+                r1 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                break;
             }
-
-            r1 = v;
             result_1[i] = r1;
         }
     }
 }
 
-void run_lb_test(int iterations, bool inter_block, int variant, const char* label) {
-    int *d_x, *d_y, *d_r0, *d_r1;
-    int *h_r0 = new int[iterations];
-    int *h_r1 = new int[iterations];
 
+/*
+ * Independent Reads of Independent Writes (IRIW) Kernel
+ *
+ * Pattern:
+ *   Initially x = 0, y = 0
+ *
+ *   P0: (block 0): x[i] = 1 (writer for x)
+ *   P1: (block 1): y[i] = 1 (writer for y)
+ *   P2 (block 2): r0=ld(x[i]); r1=ld(y[i]) (reader A: x first, then y)
+ *   P3 (block 3): r2=ld(y[i]); r3=ld(x[i]) (reader B: y first, then x)
+ *
+ * Weak Behaviour: r0==1 && r1==0 && r2==1 && r3==0
+ * (P2 sees x's write but not y's; P3 sees y's write but not x's.)
+ */
+__global__ void iriw_kernel(int *arr_x, int *arr_y,
+                            int *res_r0, int *res_r1, // P2: ld(x), ld(y)
+                            int *res_r2, int *res_r3, // P3: ld(y), ld(x)
+                            int iterations, int variant)
+{
+    int bid = blockIdx.x, tid = threadIdx.x;
+    bool is_p0 = (bid == 0 && tid == 0); // writes x
+    bool is_p1 = (bid == 1 && tid == 0); // writes y
+    bool is_p2 = (bid == 2 && tid == 0); // reads x then y
+    bool is_p3 = (bid == 3 && tid == 0); // reads y then x
+    if (!is_p0 && !is_p1 && !is_p2 && !is_p3)
+        return;
+
+    for (int i = 0; i < iterations; ++i)
+    {
+        int *ax = &arr_x[i], *ay = &arr_y[i];
+
+        if (is_p0)
+        {
+            switch (variant)
+            {
+            case TEST_IRIW_WEAK:
+                ptx_st_weak(ax, 1);
+                break;
+            case TEST_IRIW_RELAXED_GPU:
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                break;
+            case TEST_IRIW_REL_ACQ_GPU:
+                ptx_st_release(ax, 1, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_GPU:
+                ptx_st_relaxed(ax, 1, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                break;
+            case TEST_IRIW_FENCE_SC_SYS:
+                ptx_st_relaxed(ax, 1, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                break;
+            }
+        }
+        if (is_p1)
+        {
+            switch (variant)
+            {
+            case TEST_IRIW_WEAK:
+                ptx_st_weak(ay, 1);
+                break;
+            case TEST_IRIW_RELAXED_GPU:
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                break;
+            case TEST_IRIW_REL_ACQ_GPU:
+                ptx_st_release(ay, 1, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_GPU:
+                ptx_st_relaxed(ay, 1, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                break;
+            case TEST_IRIW_FENCE_SC_SYS:
+                ptx_st_relaxed(ay, 1, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                break;
+            }
+        }
+        if (is_p2)
+        {
+            int r0 = -1, r1 = -1;
+            switch (variant)
+            {
+            case TEST_IRIW_WEAK:
+                r0 = ptx_ld_weak(ax);
+                r1 = ptx_ld_weak(ay);
+                break;
+            case TEST_IRIW_RELAXED_GPU:
+                r0 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                r1 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
+            case TEST_IRIW_REL_ACQ_GPU:
+                r0 = ptx_ld_acquire(ax, SCOPE_GPU);
+                r1 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_GPU:
+                r0 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                r1 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_SYS:
+                r0 = ptx_ld_relaxed(ax, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                r1 = ptx_ld_relaxed(ay, SCOPE_SYS);
+                break;
+            }
+            res_r0[i] = r0;
+            res_r1[i] = r1;
+        }
+        if (is_p3)
+        {
+            int r2 = -1, r3 = -1;
+            switch (variant)
+            {
+            case TEST_IRIW_WEAK:
+                r2 = ptx_ld_weak(ay);
+                r3 = ptx_ld_weak(ax);
+                break;
+            case TEST_IRIW_RELAXED_GPU:
+                r2 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                r3 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
+            case TEST_IRIW_REL_ACQ_GPU:
+                r2 = ptx_ld_acquire(ay, SCOPE_GPU);
+                r3 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_GPU:
+                r2 = ptx_ld_relaxed(ay, SCOPE_GPU);
+                ptx_fence_sc_gpu();
+                r3 = ptx_ld_relaxed(ax, SCOPE_GPU);
+                break;
+            case TEST_IRIW_FENCE_SC_SYS:
+                r2 = ptx_ld_relaxed(ay, SCOPE_SYS);
+                ptx_fence_sc_sys();
+                r3 = ptx_ld_relaxed(ax, SCOPE_SYS);
+                break;
+            }
+            res_r2[i] = r2;
+            res_r3[i] = r3;
+        }
+    }
+}
+
+
+void run_sb_test(int iterations, bool inter_block, int variant, const char *label)
+{
+    int *d_x, *d_y, *d_r0, *d_r1;
     CUDA_CHECK(cudaMalloc(&d_x, iterations * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_y, iterations * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_r0, iterations * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_r1, iterations * sizeof(int)));
+    int *h_r0 = new int[iterations], *h_r1 = new int[iterations];
 
-    // Important: LB requires initial 0 values
-    CUDA_CHECK(cudaMemset(d_x, 0, iterations * sizeof(int)));
-    CUDA_CHECK(cudaMemset(d_y, 0, iterations * sizeof(int)));
-
+    Hist2 total;
+    std::vector<double> rates;
     int blocks = inter_block ? 2 : 1;
-    lb_kernel_litmus_test<<<blocks, 64>>>(d_x, d_y, d_r0, d_r1, iterations, variant, inter_block);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(h_r0, d_r0, iterations * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_r1, d_r1, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+    for (int run = 0; run < N_RUNS; ++run)
+    {
+        CUDA_CHECK(cudaMemset(d_x, 0, iterations * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_y, 0, iterations * sizeof(int)));
+        sb_kernel<<<blocks, 64>>>(d_x, d_y, d_r0, d_r1, iterations, variant, inter_block);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_r0, d_r0, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_r1, d_r1, iterations * sizeof(int), cudaMemcpyDeviceToHost));
 
-    int weak = 0;
-    for(int i=0; i<iterations; i++) {
-        // Weak behaviour: Both threads load the value 1.
-        // This implies P0 saw P1's write, and P1 saw P0's write.
-        if(h_r0[i] == 0 && h_r1[i] == 0) weak++;
+        Hist2 h;
+        long long weak = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            h.record(h_r0[i], h_r1[i]);
+            if (h_r0[i] == 0 && h_r1[i] == 0)
+                weak++;
+        }
+        total += h;
+        rates.push_back(100.0 * weak / iterations);
     }
 
-    std::cout << std::left << std::setw(30) << label 
-              << "| No Thin-air: " << std::setw(6) << weak 
-              << "(" << std::fixed << std::setprecision(4) << (100.0 * weak / iterations) << "%)\n";
+    Stats s = compute_stats(rates);
+    long long tot = total.total();
+    printf("%-38s | Weak(0,0): %8lld/%lld = %7.4f%%  [mean=%7.4f%% std=%6.4f%%]\n",
+           label, total.c[0][0], tot, 100.0 * total.c[0][0] / tot, s.mean, s.stddev);
+    print_hist2(total, "r0", "r1", true, false, false, false);
+    printf("\n");
 
-    cudaFree(d_x); cudaFree(d_y); cudaFree(d_r0); cudaFree(d_r1);
-    delete[] h_r0; delete[] h_r1;
+    cudaFree(d_x);
+    cudaFree(d_y);
+    cudaFree(d_r0);
+    cudaFree(d_r1);
+    delete[] h_r0;
+    delete[] h_r1;
 }
 
-#define ITERATIONS 5000000
+void run_mp_test(int iterations, bool inter_block, int variant, const char *label)
+{
+    int *d_data, *d_flag, *d_rf, *d_rd;
+    CUDA_CHECK(cudaMalloc(&d_data, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_flag, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_rf, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_rd, iterations * sizeof(int)));
+    int *h_rf = new int[iterations], *h_rd = new int[iterations];
 
-int main() {
-    const int N = ITERATIONS;
-    std::cout << "Store Buffer (SB) Test | Iterations: " << N << "\n";
-    std::cout << "--------------------------------------------------------\n";
-    
-    // Weak & Relaxed
-    run_sb_test(N, true, TEST_SB_WEAK,        "Inter-Block WEAK");
-    run_sb_test(N, true, TEST_SB_RELAXED_GPU, "Inter-Block RELAXED (GPU)");
-    run_sb_test(N, true, TEST_SB_RELAXED_SYS, "Inter-Block RELAXED (SYS)");
-    
-    run_sb_test(N, true, TEST_SB_RELAXED_CTA, "Inter-Block RELAXED (CTA)");
-    run_sb_test(N, false, TEST_SB_RELAXED_CTA, "Intra-Block RELAXED (CTA)");
+    Hist2 total;
+    std::vector<double> rates;
+    int blocks = inter_block ? 2 : 1;
 
-    // // Release/Acquire 
-    run_sb_test(N, true, TEST_SB_REL_ACQ_GPU, "Inter-Block ACQ/REL (GPU)");
+    for (int run = 0; run < N_RUNS; ++run)
+    {
+        CUDA_CHECK(cudaMemset(d_data, 0, iterations * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_flag, 0, iterations * sizeof(int)));
+        mp_kernel<<<blocks, 64>>>(d_data, d_flag, d_rf, d_rd, iterations, variant, inter_block);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_rf, d_rf, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_rd, d_rd, iterations * sizeof(int), cudaMemcpyDeviceToHost));
 
-    // // Fences (SC like)
-    run_sb_test(N, true, TEST_SB_FENCE_SC_GPU, "Inter-Block FENCE SC (GPU)");
-    run_sb_test(N, true, TEST_SB_FENCE_SC_SYS, "Inter-Block FENCE SC (SYS)");
+        Hist2 h;
+        long long weak = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            h.record(h_rf[i], h_rd[i]);
+            if (h_rf[i] == 1 && h_rd[i] == 0)
+                weak++;
+        }
+        total += h;
+        rates.push_back(100.0 * weak / iterations);
+    }
+
+    Stats s = compute_stats(rates);
+    long long tot = total.total();
+    // Weak outcome is c[1][0]: r_flag=1, r_data=0
+    printf("%-38s | Weak(f=1,d=0): %8lld/%lld = %7.4f%%  [mean=%7.4f%% std=%6.4f%%]\n",
+           label, total.c[1][0], tot, 100.0 * total.c[1][0] / tot, s.mean, s.stddev);
+    print_hist2(total, "r_flag", "r_data", false, true, false, false);
+    printf("\n");
+
+    cudaFree(d_data);
+    cudaFree(d_flag);
+    cudaFree(d_rf);
+    cudaFree(d_rd);
+    delete[] h_rf;
+    delete[] h_rd;
+}
+
+void run_lb_test(int iterations, bool inter_block, int variant, const char *label)
+{
+    int *d_x, *d_y, *d_r0, *d_r1;
+    CUDA_CHECK(cudaMalloc(&d_x, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_y, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r0, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r1, iterations * sizeof(int)));
+    int *h_r0 = new int[iterations], *h_r1 = new int[iterations];
+
+    Hist2 total;
+    std::vector<double> rates;
+    int blocks = inter_block ? 2 : 1;
+
+    for (int run = 0; run < N_RUNS; ++run)
+    {
+        CUDA_CHECK(cudaMemset(d_x, 0, iterations * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_y, 0, iterations * sizeof(int)));
+        lb_kernel<<<blocks, 64>>>(d_x, d_y, d_r0, d_r1, iterations, variant, inter_block);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_r0, d_r0, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_r1, d_r1, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+
+        Hist2 h;
+        long long weak = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            h.record(h_r0[i], h_r1[i]);
+            if (h_r0[i] == 1 && h_r1[i] == 1)
+                weak++; // FIXED: weak = both see 1
+        }
+        total += h;
+        rates.push_back(100.0 * weak / iterations);
+    }
+
+    Stats s = compute_stats(rates);
+    long long tot = total.total();
+    printf("%-38s | Weak(1,1): %8lld/%lld = %7.4f%%  [mean=%7.4f%% std=%6.4f%%]\n",
+           label, total.c[1][1], tot, 100.0 * total.c[1][1] / tot, s.mean, s.stddev);
+    print_hist2(total, "r0", "r1", false, false, false, true);
+    printf("\n");
+
+    cudaFree(d_x);
+    cudaFree(d_y);
+    cudaFree(d_r0);
+    cudaFree(d_r1);
+    delete[] h_r0;
+    delete[] h_r1;
+}
+
+void run_iriw_test(int iterations, int variant, const char *label)
+{
+    int *d_x, *d_y, *d_r0, *d_r1, *d_r2, *d_r3;
+    CUDA_CHECK(cudaMalloc(&d_x, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_y, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r0, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r1, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r2, iterations * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_r3, iterations * sizeof(int)));
+    int *h_r0 = new int[iterations], *h_r1 = new int[iterations];
+    int *h_r2 = new int[iterations], *h_r3 = new int[iterations];
+
+    Hist2 hist_p2, hist_p3; // P2: (ld x, ld y); P3: (ld y, ld x)
+    long long total_weak = 0, total_obs = 0;
+    std::vector<double> rates;
+
+    for (int run = 0; run < N_RUNS; ++run)
+    {
+        CUDA_CHECK(cudaMemset(d_x, 0, iterations * sizeof(int)));
+        CUDA_CHECK(cudaMemset(d_y, 0, iterations * sizeof(int)));
+        iriw_kernel<<<4, 64>>>(d_x, d_y, d_r0, d_r1, d_r2, d_r3, iterations, variant);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_r0, d_r0, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_r1, d_r1, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_r2, d_r2, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_r3, d_r3, iterations * sizeof(int), cudaMemcpyDeviceToHost));
+
+        long long weak = 0, obs = 0;
+        for (int i = 0; i < iterations; i++)
+        {
+            int r0 = h_r0[i], r1 = h_r1[i], r2 = h_r2[i], r3 = h_r3[i];
+            bool valid = (r0 >= 0 && r0 <= 1 && r1 >= 0 && r1 <= 1 && r2 >= 0 && r2 <= 1 && r3 >= 0 && r3 <= 1);
+            if (valid)
+            {
+                obs++;
+                hist_p2.record(r0, r1);
+                hist_p3.record(r2, r3);
+                if (r0 == 1 && r1 == 0 && r2 == 1 && r3 == 0)
+                    weak++;
+            }
+        }
+        total_weak += weak;
+        total_obs += obs;
+        rates.push_back(obs > 0 ? 100.0 * weak / obs : 0.0);
+    }
+
+    Stats s = compute_stats(rates);
+    printf("%-38s | Weak(r0=1,r1=0,r2=1,r3=0): %lld/%lld = %7.4f%%  [mean=%7.4f%% std=%6.4f%%]\n",
+           label, total_weak, total_obs,
+           total_obs > 0 ? 100.0 * total_weak / total_obs : 0.0,
+           s.mean, s.stddev);
+
+    // P2 view: reads x then y
+    long long p2t = hist_p2.total(), p3t = hist_p3.total();
+    if (p2t > 0)
+    {
+        printf("  P2 (x→y): (0,0)=%lld(%.1f%%) (1,0)*=%lld(%.1f%%) (0,1)=%lld(%.1f%%) (1,1)=%lld(%.1f%%)\n",
+               hist_p2.c[0][0], 100.0 * hist_p2.c[0][0] / p2t,
+               hist_p2.c[1][0], 100.0 * hist_p2.c[1][0] / p2t,
+               hist_p2.c[0][1], 100.0 * hist_p2.c[0][1] / p2t,
+               hist_p2.c[1][1], 100.0 * hist_p2.c[1][1] / p2t);
+    }
+    if (p3t > 0)
+    {
+        printf("  P3 (y→x): (0,0)=%lld(%.1f%%) (1,0)*=%lld(%.1f%%) (0,1)=%lld(%.1f%%) (1,1)=%lld(%.1f%%)\n",
+               hist_p3.c[0][0], 100.0 * hist_p3.c[0][0] / p3t,
+               hist_p3.c[1][0], 100.0 * hist_p3.c[1][0] / p3t,
+               hist_p3.c[0][1], 100.0 * hist_p3.c[0][1] / p3t,
+               hist_p3.c[1][1], 100.0 * hist_p3.c[1][1] / p3t);
+    }
+    printf("\n");
+
+    cudaFree(d_x);
+    cudaFree(d_y);
+    cudaFree(d_r0);
+    cudaFree(d_r1);
+    cudaFree(d_r2);
+    cudaFree(d_r3);
+    delete[] h_r0;
+    delete[] h_r1;
+    delete[] h_r2;
+    delete[] h_r3;
+}
 
 
-    std::cout << "Message Passing (MP) Test | Iterations: " << N << "\n";
-    std::cout << "--------------------------------------------------------\n";
-    
-    run_mp_test(N, true, TEST_MP_WEAK,        "Inter-Block WEAK");
-    run_mp_test(N, false, TEST_MP_RELAXED_CTA,  "Intra-Block RELAXED (CTA)");
-    run_mp_test(N, true, TEST_MP_RELAXED_GPU, "Inter-Block RELAXED (GPU)");
-    run_mp_test(N, true, TEST_MP_RELAXED_SYS, "Inter-Block RELAXED (SYS)");
+int main()
+{
+    printf("Test %d runs x %d iter = %lld total obs/test\n\n",
+           N_RUNS, ITERATIONS, (long long)N_RUNS * ITERATIONS);
 
-    run_mp_test(N, false, TEST_MP_REL_ACQ_CTA,  "Intra-Block ACQ/REL (CTA)");
-    run_mp_test(N, true, TEST_MP_REL_ACQ_GPU, "Inter-Block ACQ/REL (GPU)");
-    run_mp_test(N, true, TEST_MP_REL_ACQ_SYS, "Inter-Block ACQ/REL (SYS)");
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("STORE BUFFERING (SB)   P0: st(x,1); r0=ld(y)  ||  P1: st(y,1); r1=ld(x)\n");
+    printf("Weak outcome: r0==0 && r1==0   (* marks weak cell in distribution)\n");
+    printf("══════════════════════════════════════════════════════════════════════════════\n\n");
+    run_sb_test(ITERATIONS, true, TEST_SB_WEAK, "SB Inter-Block WEAK");
+    run_sb_test(ITERATIONS, true, TEST_SB_RELAXED_GPU, "SB Inter-Block RELAXED (GPU)");
+    run_sb_test(ITERATIONS, true, TEST_SB_RELAXED_SYS, "SB Inter-Block RELAXED (SYS)");
+    run_sb_test(ITERATIONS, true, TEST_SB_RELAXED_CTA, "SB Inter-Block RELAXED (CTA)");
+    run_sb_test(ITERATIONS, false, TEST_SB_RELAXED_CTA, "SB Intra-Block RELAXED (CTA)");
+    run_sb_test(ITERATIONS, true, TEST_SB_REL_ACQ_GPU, "SB Inter-Block ACQ/REL (GPU)");
+    run_sb_test(ITERATIONS, true, TEST_SB_FENCE_SC_GPU, "SB Inter-Block FENCE SC (GPU)");
+    run_sb_test(ITERATIONS, true, TEST_SB_FENCE_SC_SYS, "SB Inter-Block FENCE SC (SYS)");
 
-    run_mp_test(N, false, TEST_MP_FENCE_SC_CTA, "Intra-Block FENCE SC (CTA)");
-    run_mp_test(N, true, TEST_MP_FENCE_SC_GPU, "Inter-Block FENCE SC (GPU)");
-    run_mp_test(N, true, TEST_MP_FENCE_SC_SYS, "Inter-Block FENCE SC (SYS)");
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("MESSAGE PASSING (MP)   P0: data=1; flag=1  ||  P1: r_flag=ld(flag); r_data=ld(data)\n");
+    printf("Weak outcome: r_flag==1 && r_data==0\n");
+    printf("══════════════════════════════════════════════════════════════════════════════\n\n");
+    run_mp_test(ITERATIONS, true, TEST_MP_WEAK, "MP Inter-Block WEAK");
+    run_mp_test(ITERATIONS, false, TEST_MP_RELAXED_CTA, "MP Intra-Block RELAXED (CTA)");
+    run_mp_test(ITERATIONS, true, TEST_MP_RELAXED_GPU, "MP Inter-Block RELAXED (GPU)");
+    run_mp_test(ITERATIONS, true, TEST_MP_RELAXED_SYS, "MP Inter-Block RELAXED (SYS)");
+    run_mp_test(ITERATIONS, false, TEST_MP_REL_ACQ_CTA, "MP Intra-Block ACQ/REL (CTA)");
+    run_mp_test(ITERATIONS, true, TEST_MP_REL_ACQ_GPU, "MP Inter-Block ACQ/REL (GPU)");
+    run_mp_test(ITERATIONS, true, TEST_MP_REL_ACQ_SYS, "MP Inter-Block ACQ/REL (SYS)");
+    run_mp_test(ITERATIONS, false, TEST_MP_FENCE_SC_CTA, "MP Intra-Block FENCE SC (CTA)");
+    run_mp_test(ITERATIONS, true, TEST_MP_FENCE_SC_GPU, "MP Inter-Block FENCE SC (GPU)");
+    run_mp_test(ITERATIONS, true, TEST_MP_FENCE_SC_SYS, "MP Inter-Block FENCE SC (SYS)");
 
-    std::cout << "Load Buffering (LB) Test | Iterations: " << N << "\n";
-    std::cout << "--------------------------------------------------------\n";
-    
-    run_lb_test(N, true, TEST_LB_WEAK,        "Inter-Block WEAK");
-    run_lb_test(N, true, TEST_LB_RELAXED_GPU, "Inter-Block RELAXED (GPU)");
-    run_lb_test(N, true, TEST_LB_ACQ_REL_GPU, "Inter-Block ACQ/REL (GPU)");
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("LOAD BUFFERING (LB)   P0: r0=ld(y); st(x,1)  ||  P1: r1=ld(x); st(y,1)\n");
+    printf("Weak outcome: r0==1 && r1==1   (causality cycle)\n");
+    printf("══════════════════════════════════════════════════════════════════════════════\n\n");
+    run_lb_test(ITERATIONS, true, TEST_LB_WEAK, "LB Inter-Block WEAK");
+    run_lb_test(ITERATIONS, true, TEST_LB_RELAXED_GPU, "LB Inter-Block RELAXED (GPU)");
+    run_lb_test(ITERATIONS, true, TEST_LB_RELAXED_SYS, "LB Inter-Block RELAXED (SYS)");
+    run_lb_test(ITERATIONS, true, TEST_LB_ACQ_REL_GPU, "LB Inter-Block ACQ/REL (GPU)");
+    run_lb_test(ITERATIONS, true, TEST_LB_FENCE_SC_GPU, "LB Inter-Block FENCE SC (GPU)");
 
+    printf("══════════════════════════════════════════════════════════════════════════════\n");
+    printf("INDEP. READS OF INDEP. WRITES (IRIW)  — 4-thread / 4-block test\n");
+    printf("  P0: x=1  ||  P1: y=1  ||  P2: r0=ld(x); r1=ld(y)  ||  P3: r2=ld(y); r3=ld(x)\n");
+    printf("Weak (non-MCA) outcome: r0==1 && r1==0 && r2==1 && r3==0\n");
+    printf("══════════════════════════════════════════════════════════════════════════════\n\n");
+    run_iriw_test(ITERATIONS, TEST_IRIW_WEAK, "IRIW WEAK");
+    run_iriw_test(ITERATIONS, TEST_IRIW_RELAXED_GPU, "IRIW RELAXED (GPU)");
+    run_iriw_test(ITERATIONS, TEST_IRIW_REL_ACQ_GPU, "IRIW ACQ/REL (GPU)");
+    run_iriw_test(ITERATIONS, TEST_IRIW_FENCE_SC_GPU, "IRIW FENCE SC (GPU)");
+    run_iriw_test(ITERATIONS, TEST_IRIW_FENCE_SC_SYS, "IRIW FENCE SC (SYS)");
 
     return 0;
 }
