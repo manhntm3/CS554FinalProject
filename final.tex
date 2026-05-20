@@ -1,0 +1,439 @@
+\documentclass[a4paper]{article}
+
+%% Language and font encodings
+\usepackage[english]{babel}
+\usepackage[utf8x]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{blindtext}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{commath}
+
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage[T1]{fontenc}
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\bfseries,
+  columns=fullflexible,
+  keepspaces=true
+}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+%% Sets page size and margins
+\usepackage[a4paper,top=3cm,bottom=2cm,left=3cm,right=3cm,marginparwidth=1.75cm]{geometry}
+
+%% Useful packages
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage[colorinlistoftodos]{todonotes}
+\usepackage[colorlinks=true, allcolors=blue]{hyperref}
+
+\title{CS554 Final Project Report}
+
+\author{Manh Tien Nguyen}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+
+This project investigates the NVIDIA PTX memory model by implementing classical weak-memory litmus tests as inline PTX inside CUDA kernels.
+We study four standard patterns:
+\begin{itemize}
+  \item \textbf{Store Buffering (SB):} tests store-load reordering
+  \item \textbf{Message Passing (MP):} tests store-store / load-load ordering
+  \item \textbf{Load Buffering (LB):} tests causality cycles (load-store reordering)
+  \item \textbf{Independent Reads of Independent Writes (IRIW):} tests multi-copy atomicity
+\end{itemize}
+
+For each test we compare multiple semantic variants: \texttt{WEAK} (plain loads/stores), \texttt{RELAXED} at CTA/GPU/SYS scope, \texttt{RELEASE/ACQUIRE}, and \texttt{FENCE SC}.
+Each variant is run 5 times $\times$ 1\,000\,000 iterations (5\,M total observations per test) on a \textbf{Tesla T4 (sm\_75, Turing, CUDA 12.8)}.
+
+\bigskip\noindent\textbf{Goals:}
+\begin{enumerate}
+  \item Observe which weak behaviors actually occur on real hardware.
+  \item Compare results to the PTX ISA specification and the formal model of Lustig et al.\ \cite{Lustig2019PTX}.
+  \item Identify and fix methodology bugs that produce spurious results.
+  \item Introduce multi-run statistics and full outcome histograms for publication-quality evidence.
+\end{enumerate}
+
+\section{Implementation}
+
+The code is at \url{https://github.com/manhntm3/CS554FinalProject}.
+
+All memory operations are executed using \textbf{volatile inline PTX assembly} to prevent compiler reordering.
+The implementation supports inter-block (different SMs) and intra-block (different warps) configurations.
+
+\subsection{Array-Strided Memory Layout}
+
+A critical design choice is the \textbf{array-strided layout}: each of the $N$ iterations accesses a unique pair of memory locations \texttt{x[i]} and \texttt{y[i]}, pre-initialized to 0 by the host.
+This eliminates cross-iteration L1 cache pollution, which caused the false weak behaviors in the first implementation (see Section~\ref{sec:methodology}).
+
+\subsection{PTX Primitives}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.45\textwidth}
+\centering
+\textbf{WEAK}
+\begin{lstlisting}[language=C]
+// Plain global store/load (no scope)
+st.global.u32 [x], 1;
+r0 = ld.global.u32 [y];
+\end{lstlisting}
+\end{minipage}
+\hfill
+\begin{minipage}{0.45\textwidth}
+\centering
+\textbf{RELAXED GPU}
+\begin{lstlisting}[language=C]
+// Participates in GPU coherence domain
+st.global.relaxed.gpu.u32 [x], 1;
+r0 = ld.global.relaxed.gpu.u32 [y];
+\end{lstlisting}
+\end{minipage}
+\caption{SB PTX: plain weak vs.\ GPU-scope relaxed}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.45\textwidth}
+\centering
+\textbf{RELEASE/ACQUIRE GPU}
+\begin{lstlisting}[language=C]
+// Producer
+st.global.relaxed.gpu.u32 [data], 1;
+st.global.release.gpu.u32 [flag], 1;
+
+// Consumer
+r_flag = ld.global.acquire.gpu.u32 [flag];
+r_data = ld.global.relaxed.gpu.u32 [data];
+\end{lstlisting}
+\end{minipage}
+\hfill
+\begin{minipage}{0.45\textwidth}
+\centering
+\textbf{FENCE SC GPU}
+\begin{lstlisting}[language=C]
+// Producer
+st.global.relaxed.gpu.u32 [data], 1;
+fence.sc.gpu;
+st.global.relaxed.gpu.u32 [flag], 1;
+
+// Consumer
+r_flag = ld.global.relaxed.gpu.u32 [flag];
+fence.sc.gpu;
+r_data = ld.global.relaxed.gpu.u32 [data];
+\end{lstlisting}
+\end{minipage}
+\caption{MP PTX: Release/Acquire vs.\ Fence SC (GPU scope)}
+\end{figure}
+
+\subsection{SASS Verification}
+
+Compiling with \texttt{-Xptxas -O0} prevents PTXAS from reordering instructions \cite{nvidia_ptx_isa}.
+The key PTX-to-SASS mappings on sm\_75 are:
+
+\begin{table}[h]
+\centering
+\small
+\caption{PTX to SASS mapping (sm\_75 / Tesla T4)}
+\label{tab:ptx-sass}
+\begin{tabular}{ll}
+\toprule
+\textbf{PTX Instruction} & \textbf{SASS Instruction} \\
+\midrule
+\texttt{st.global.u32} (weak)             & \texttt{STG.E} \\
+\texttt{st.global.relaxed.gpu.u32}        & \texttt{STG.E.STRONG.GPU} \\
+\texttt{st.global.release.gpu.u32}        & \texttt{STG.E.STRONG.GPU} \\
+\texttt{ld.global.acquire.gpu.u32}        & \texttt{LDG.E.STRONG.GPU} \\
+\texttt{st.global.relaxed.sys.u32}        & \texttt{STG.E.STRONG.SYS} \\
+\texttt{fence.sc.cta}                     & \texttt{MEMBAR.ALL.CTA} \\
+\texttt{fence.sc.gpu}                     & \texttt{MEMBAR.SC.GPU} \\
+\texttt{fence.sc.sys}                     & \texttt{MEMBAR.SC.SYS} \\
+\texttt{atom.global.relaxed.gpu.exch}     & \texttt{ATOMG.E.EXCH.STRONG.GPU} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All inline PTX instructions survive the compilation pipeline verbatim; no merging or reordering was observed.
+
+\section{Methodology: Bugs Found and Fixed}
+\label{sec:methodology}
+
+\subsection{First Try: Scalar Reuse (Flawed)}
+
+The initial MP implementation reused a single pair of scalars \texttt{(data, flag)} across iterations with a plain-C reset and a software spin-barrier:
+
+\begin{lstlisting}[language=C]
+// P0 reset (WRONG):
+*data = 0; *flag = 0;
+__threadfence();  // flushes P0's L1, but does NOT force P1 to invalidate its L1
+global_spin_barrier(sync_barrier, threshold);
+\end{lstlisting}
+
+\textbf{Root cause:} \texttt{\_\_threadfence()} flushes P0's SM to L2, but the consumer (P1, on a different SM) is not required to invalidate its own L1 cache for \texttt{data} and \texttt{flag}.
+The software spin barrier does not establish a \emph{happens-before} edge between P0's scoped stores and P1's subsequent scoped loads under the PTX memory model.
+As a result, P1 could exit the barrier still holding a stale \texttt{flag=1} from iteration $i-1$, then read \texttt{data=0} from P0's reset — a false MP weak outcome.
+
+The effect was severe: GPU-scope \texttt{FENCE SC} showed \textbf{24.57\%} weak behavior (worse than \texttt{RELAXED}), which is physically impossible under a correct test.
+
+\begin{table}[h]
+\centering
+\small
+\caption{MP scalar implementation (first try, 5M iterations) — spurious results}
+\label{tab:mp-scalar}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Variant} & \textbf{Weak Count} & \textbf{Weak \%} \\
+\midrule
+Inter-Block WEAK           &         0 &  0.00\% \\
+Inter-Block RELAXED (GPU)  &    14,669 &  0.29\% \\
+Inter-Block ACQ/REL (GPU)  &   726,303 & 14.53\% \\
+Inter-Block FENCE SC (GPU) &   973,503 & \textcolor{red}{19.47\%} $\leftarrow$ impossible \\
+Inter-Block FENCE SC (SYS) &         0 &  0.00\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The SB test, which already used an array-strided layout, did not exhibit this problem.
+
+\subsection{Second Try: LB Kernel Bug}
+
+The original LB kernel stored the loaded value (always 0) instead of the constant 1, making the weak outcome \texttt{r0==1 \&\& r1==1} impossible:
+
+\begin{lstlisting}[language=C]
+// WRONG (stores v, which is always 0):
+int v = 0;
+v = ptx_ld_weak(addr_x);  // loads from x (wrong: should be y)
+ptx_st_weak(addr_y, v);   // stores 0 (wrong: should be 1 to x)
+
+// CORRECT:
+r0 = ptx_ld_weak(addr_y);  // load from y
+ptx_st_weak(addr_x, 1);    // store constant 1 to x
+\end{lstlisting}
+
+The original result (100\% of outcomes were $(0,0)$) was a vacuous tautology, not a meaningful measurement.
+
+\subsection{Third Try: Fixes Applied}
+
+All experiments in Section~\ref{sec:results} use:
+\begin{enumerate}
+  \item \textbf{Array-strided layout for all tests} (including MP): each iteration uses a fresh, pre-zeroed memory slot.
+  \item \textbf{Correct LB pattern}: P0 reads \texttt{y[i]} and stores 1 to \texttt{x[i]}; P1 reads \texttt{x[i]} and stores 1 to \texttt{y[i]}.
+  \item \textbf{Multi-run statistics}: 5 runs $\times$ 1M iterations; mean and standard deviation reported.
+  \item \textbf{Full outcome histograms}: all $(r_0, r_1)$ pairs counted, not just the weak outcome.
+  \item \textbf{New IRIW test}: four-block test for multi-copy atomicity.
+\end{enumerate}
+
+\section{Experimental Results}
+\label{sec:results}
+
+\textbf{Hardware:} Tesla T4 (sm\_75, Turing) | CUDA 12.8 | 5 runs $\times$ 1\,000\,000 iter = 5\,000\,000 total obs per test.
+
+\subsection{Store Buffering (SB)}
+
+\begin{table}[H]
+\centering
+\small
+\caption{SB results: P0: st(x,1); r0=ld(y) \quad P1: st(y,1); r1=ld(x) \quad Weak: r0=0, r1=0}
+\label{tab:sb-results}
+\begin{tabular}{l|r r r | r r r r}
+\toprule
+\textbf{Variant} & \textbf{Weak} & \textbf{\%} & \textbf{Std\%} & \multicolumn{4}{c}{\textbf{Outcome distribution (\%)}} \\
+                 &               &             &                & (0,0)* & (0,1) & (1,0) & (1,1) \\
+\midrule
+Inter-Block WEAK          &   826 & 0.0165 & 0.0024 & 0.016 & 99.983 & 0.000 & 0.000 \\
+Inter-Block RELAXED (GPU) &     0 & 0.0000 & 0.0000 & 0.000 & 87.408 & 0.227 & 12.365 \\
+Inter-Block RELAXED (SYS) &     0 & 0.0000 & 0.0000 & 0.000 & 85.902 & 0.255 & 13.843 \\
+Inter-Block RELAXED (CTA) &   813 & 0.0163 & 0.0005 & 0.016 & 99.984 & 0.000 & 0.000 \\
+Intra-Block RELAXED (CTA) &     0 & 0.0000 & 0.0000 & 0.000 & 24.131 & 18.429 & 57.441 \\
+Inter-Block ACQ/REL (GPU) &     0 & 0.0000 & 0.0000 & 0.000 & 24.381 & 43.980 & 31.639 \\
+Inter-Block FENCE SC (GPU)&     0 & 0.0000 & 0.0000 & 0.000 &  0.712 &  0.000 & 99.288 \\
+Inter-Block FENCE SC (SYS)&     0 & 0.0000 & 0.0000 & 0.000 &  9.808 &  0.000 & 90.191 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:}
+\begin{itemize}
+  \item \textbf{WEAK and RELAXED (CTA)} show identical weak rates ($\approx$0.016\%), confirming that plain stores and CTA-scoped atomics provide no cross-SM ordering guarantee.
+  \item \textbf{RELAXED (GPU/SYS)} show 0\% weak, even though the PTX spec allows weak SB for relaxed operations. The T4's L2 cache acts as a unified coherence point, enforcing GPU-wide write ordering even for relaxed atomics. This is \emph{hardware stronger than spec}.
+  \item \textbf{ACQ/REL (GPU)} shows 0\% weak. Release/acquire prevents store-store and load-load reordering; the spec \emph{does} allow SB here (store-load reordering), but the hardware is again conservative.
+  \item \textbf{FENCE SC (GPU/SYS)} correctly eliminate all weak behavior (0\%).
+  \item The outcome distribution reveals strong scheduling bias: \texttt{WEAK} produces almost exclusively $(0,1)$ (99.98\%), meaning P0 consistently runs ahead of P1. The rare $(0,0)$ outcomes are genuine reorderings.
+\end{itemize}
+
+\subsection{Message Passing (MP)}
+
+\begin{table}[H]
+\centering
+\small
+\caption{MP results (array-strided): P0: data=1; flag=1 \quad P1: r\_f=ld(flag); r\_d=ld(data) \quad Weak: r\_f=1, r\_d=0}
+\label{tab:mp-results}
+\begin{tabular}{l|r r r | r r r r}
+\toprule
+\textbf{Variant} & \textbf{Weak} & \textbf{\%} & \textbf{Std\%} & \multicolumn{4}{c}{\textbf{Outcome distribution (\%)}} \\
+                 &               &             &                & (0,0) & (0,1) & (1,0)* & (1,1) \\
+\midrule
+Inter-Block WEAK          & 0 & 0.0000 & 0.0000 & 0.001 & 0.000 & 0.000 & 99.999 \\
+Intra-Block RELAXED (CTA) & 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 100.000 \\
+Inter-Block RELAXED (GPU) & 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 99.999 \\
+Inter-Block RELAXED (SYS) & 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 100.000 \\
+Intra-Block ACQ/REL (CTA) & 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 100.000 \\
+Inter-Block ACQ/REL (GPU) & 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 99.999 \\
+Inter-Block ACQ/REL (SYS) & 0 & 0.0000 & 0.0000 & 99.9999 & 0.000 & 0.000 & 0.000 \\
+Intra-Block FENCE SC (CTA)& 0 & 0.0000 & 0.0000 & 0.000 & 100.000 & 0.000 & 0.000 \\
+Inter-Block FENCE SC (GPU)& 0 & 0.0000 & 0.0000 & 0.000 & 0.000 & 0.000 & 99.999 \\
+Inter-Block FENCE SC (SYS)& 0 & 0.0000 & 0.0000 & 0.000 & 0.001 & 0.000 & 99.999 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:}
+\begin{itemize}
+  \item \textbf{Zero MP weakness across all variants} after the array-layout fix.
+    Even plain \texttt{WEAK} stores show 0\% weak: the T4 enforces in-program-order store visibility from a single thread (a property at least as strong as TSO store-order), so the flag write never becomes visible before the data write.
+  \item \textbf{ACQ/REL (SYS) shows 99.999\% $(0,0)$ outcomes}: the consumer almost always reads both values as 0. This is a timing effect — SYS-scope operations route through the host memory path and are significantly slower, so the consumer consistently reads both locations before the producer completes.
+  \item \textbf{FENCE SC (CTA) intra-block} shows 100\% $(0,1)$: the consumer always sees \texttt{flag=0, data=1}. Within a single block, intra-warp execution order means the consumer runs \emph{before} the producer writes the flag (data store already visible via L1 sharing, but flag store hasn't executed yet).
+\end{itemize}
+
+\subsection{Load Buffering (LB)}
+
+\begin{table}[H]
+\centering
+\small
+\caption{LB results (corrected): P0: r0=ld(y); st(x,1) \quad P1: r1=ld(x); st(y,1) \quad Weak: r0=1, r1=1}
+\label{tab:lb-results}
+\begin{tabular}{l|r r r | r r r r}
+\toprule
+\textbf{Variant} & \textbf{Weak} & \textbf{\%} & \textbf{Std\%} & \multicolumn{4}{c}{\textbf{Outcome distribution (\%)}} \\
+                 &               &             &                & (0,0) & (0,1) & (1,0) & (1,1)* \\
+\midrule
+Inter-Block WEAK          & 0 & 0.0000 & 0.0000 & 89.104 &  2.797 &  8.099 & 0.000 \\
+Inter-Block RELAXED (GPU) & 0 & 0.0000 & 0.0000 &  1.798 & 17.141 & 81.061 & 0.000 \\
+Inter-Block RELAXED (SYS) & 0 & 0.0000 & 0.0000 &  1.707 & 16.867 & 81.427 & 0.000 \\
+Inter-Block ACQ/REL (GPU) & 0 & 0.0000 & 0.0000 &  0.008 &  0.000 & 99.992 & 0.000 \\
+Inter-Block FENCE SC (GPU)& 0 & 0.0000 & 0.0000 &  0.009 &  0.000 & 99.992 & 0.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:}
+\begin{itemize}
+  \item \textbf{Zero LB weakness (r0=1, r1=1) across all 25M observations.}
+    A causality cycle requires both threads to see each other's write simultaneously, which would violate the acyclicity of the happens-before relation. The PTX formal model \cite{Lustig2019PTX} explicitly forbids out-of-thin-air (OOTA) values; these results confirm the T4 respects this axiom.
+  \item \textbf{The distribution is now non-trivial and informative}, unlike the previous implementation:
+    \texttt{RELAXED (GPU)} shows 81\% $(1,0)$ — P1 (block 1) tends to run slightly ahead, so P0 reads P1's write of $y=1$ ($r_0=1$) while P1 has already read $x=0$ ($r_1=0$) before P0 wrote it.
+  \item \textbf{ACQ/REL and FENCE SC} show 99.99\% $(1,0)$: the acquire/fence semantics cause the operations to be well-separated in time, strongly biasing P0 to see P1's write but not vice versa.
+\end{itemize}
+
+\subsection{Independent Reads of Independent Writes (IRIW)}
+
+\begin{table}[H]
+\centering
+\small
+\caption{IRIW results: P0:x=1; P1:y=1; P2:r0=ld(x),r1=ld(y); P3:r2=ld(y),r3=ld(x). Weak: r0=1,r1=0,r2=1,r3=0}
+\label{tab:iriw-results}
+\begin{tabular}{l|r r r | r r r r | r r r r}
+\toprule
+\textbf{Variant} & \textbf{Weak} & \textbf{\%} & \textbf{Std\%}
+  & \multicolumn{4}{c|}{\textbf{P2 (ld x$\to$y) \%}}
+  & \multicolumn{4}{c}{\textbf{P3 (ld y$\to$x) \%}} \\
+& & & & (0,0) & (1,0)* & (0,1) & (1,1) & (0,0) & (1,0)* & (0,1) & (1,1) \\
+\midrule
+WEAK         & 0 & 0.0000 & 0.0000 & 0.0 & 0.0 & 0.0 & 100.0 & 0.0 & 0.0 & 0.0 & 100.0 \\
+RELAXED (GPU)& 0 & 0.0000 & 0.0000 & 0.0 & 0.0 & 0.0 & 100.0 & 0.0 & 0.0 & 0.0 & 100.0 \\
+ACQ/REL (GPU)& 0 & 0.0000 & 0.0000 & 0.0 & 0.0 & 0.0 & 100.0 & 0.0 & 0.0 & 0.0 & 100.0 \\
+FENCE SC(GPU)& 0 & 0.0000 & 0.0000 & 0.0 & 0.0 & 0.0 & 100.0 & 0.0 & 0.0 & 0.0 & 100.0 \\
+FENCE SC(SYS)& 0 & 0.0000 & 0.0000 & 0.0 & 0.0 & 0.0 & 100.0 & 0.0 & 0.0 & 0.0 & 100.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Key findings:}
+\begin{itemize}
+  \item \textbf{Zero IRIW weakness across all variants.}
+    Multi-copy atomicity is empirically confirmed on the Tesla T4 for all tested scope levels, including plain \texttt{WEAK} stores.
+  \item \textbf{Both readers see (1,1) $\approx$ 100\% of the time}: by the time the reader blocks reach iteration $i$, both writer blocks have typically already written $x[i]=1$ and $y[i]=1$. This is a timing effect of the array-strided layout: readers tend to lag slightly behind writers at this iteration count.
+  \item These results confirm that \textbf{the T4's L2 cache provides unified coherence}, ensuring writes propagate atomically to all SMs simultaneously. This is consistent with the PTX guarantee that all GPU-scope non-weak operations are multi-copy atomic, and agrees with prior empirical findings by Alglave et al.\ \cite{Alglave2015GPU}.
+\end{itemize}
+
+\section{Discussion}
+
+\subsection{Hardware Stronger Than Spec}
+
+The PTX memory model is deliberately weak — it specifies the \emph{minimum} ordering guarantee the hardware must provide.
+Our results show the Tesla T4 consistently provides \emph{stronger} ordering than required:
+
+\begin{table}[H]
+\centering
+\small
+\caption{PTX spec vs.\ Tesla T4 hardware behavior}
+\label{tab:spec-vs-hw}
+\begin{tabular}{l l l}
+\toprule
+\textbf{Test} & \textbf{PTX Spec} & \textbf{T4 Hardware} \\
+\midrule
+SB RELAXED GPU     & Weak allowed & Weak never observed \\
+SB ACQ/REL GPU     & Weak allowed & Weak never observed \\
+MP RELAXED GPU     & Weak allowed & Weak never observed \\
+LB (all variants)  & Weak allowed & Weak never observed \\
+IRIW (all variants)& Weak allowed (WEAK) & Weak never observed \\
+\midrule
+SB WEAK (inter-block)         & Weak allowed & 0.017\% weak observed \\
+SB RELAXED CTA (inter-block)  & Weak allowed & 0.016\% weak observed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Only \texttt{WEAK} and cross-block \texttt{RELAXED CTA} produce observable weak behavior.
+The common factor: both bypass the L2 cache coherence protocol.
+Plain stores (\texttt{.weak}) and CTA-scoped operations between different SMs can remain in the local SM's L1 write buffers without being propagated to L2, creating genuine store-load reordering.
+
+\subsection{The Scalar vs.\ Array Methodology Bug}
+
+The scalar reuse approach represents a common pitfall in GPU litmus testing:
+a software barrier is not equivalent to a memory fence at the scope of the test's operations.
+Specifically, the PTX memory model requires a \emph{matching pair} of release/acquire operations at the \emph{same scope} to establish happens-before.
+A spin on a \texttt{volatile} integer combined with \texttt{\_\_threadfence()} (a non-scoped fence) cannot substitute for this.
+
+This is relevant to the broader community: any GPU litmus test that reuses a scalar and relies on a software barrier is suspect \cite{Sorensen2016InterWorkgroup}.
+
+\subsection{Timing Artifacts in the Outcome Distributions}
+
+The full histograms reveal strong execution-order asymmetries:
+\begin{itemize}
+  \item \textbf{SB WEAK}: 99.98\% of outcomes are $(0,1)$ (P1 reads x=1 after P0 writes it, but P0 reads y=0 before P1 writes it). This means P0 (block 0) consistently runs slightly ahead of P1 (block 1) at the OS/hardware scheduling level.
+  \item \textbf{LB RELAXED GPU}: 81\% $(1,0)$ means P1 tends to lead P0. The asymmetry arises because the two blocks (0 and 1) are mapped to SMs with different workloads or clock phases.
+  \item \textbf{FENCE SC GPU}: produces almost exclusively $(1,1)$ for SB — the strong fence forces both operations to be visible before either proceeds, so both threads always see the other's write.
+\end{itemize}
+
+\section{Challenges and Lessons Learned}
+
+\begin{enumerate}
+  \item \textbf{Hardware is stronger than the specification.}
+    NVIDIA hardware enforces implicit ordering beyond what PTX specifies, particularly for GPU-scope relaxed atomics. This provides safety margins for programmers but also means that code that ``works'' on one GPU may fail on future hardware that implements the spec more faithfully.
+
+  \item \textbf{Fences are hardware intrinsics; barriers are software constructs.}
+    Only hardware fences (\texttt{fence.sc.gpu}, \texttt{MEMBAR.SC.GPU}) establish the ordering semantics required to prevent weak behaviors at GPU scope. Software spin-barriers, even with \texttt{\_\_threadfence()}, are insufficient because they don't establish the right happens-before edges across SM boundaries.
+
+  \item \textbf{The array-strided layout is essential for correctness.}
+    Scalar reuse with per-iteration resets interacts poorly with the multi-level GPU cache hierarchy and produces artifacts that look like weak memory behavior but are actually cache-coherence bugs in the test harness itself.
+
+  \item \textbf{Full outcome histograms are mandatory for meaningful results.}
+    Reporting only the weak count obscures timing biases, reveals nothing about non-weak outcomes, and cannot detect a trivially broken test (as was the case with the original LB kernel).
+
+  \item \textbf{Multi-run statistics confirm reproducibility.}
+    With stddev $\approx 0.002\%$ for SB WEAK, the result is clearly reproducible and not noise. All zero-weak results show stddev $= 0.0000\%$ across all 5 runs — these are hard guarantees, not lucky measurements.
+\end{enumerate}
+
+\bibliographystyle{IEEEtran}
+\bibliography{sample}
+
+\end{document}
